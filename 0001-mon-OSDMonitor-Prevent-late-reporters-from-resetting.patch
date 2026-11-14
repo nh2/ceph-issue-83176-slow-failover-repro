@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Niklas=20Hamb=C3=BCchen?= <mail@nh2.me>
+Date: Sat, 14 Nov 2026 21:21:18 +0000
+Subject: [PATCH] mon/OSDMonitor: Prevent late reporters from resetting OSD
+ failure start
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fixes that OSDs of a dead host could be marked down minutes, instead of
+seconds, after their heartbeat grace had passed (unnecessarily slow
+failover).
+
+Done by measuring an OSD's failure duration from the oldest reports of
+the agreeing CRUSH subtrees, instead of from the newest report, as newer
+reports restart the failure clock every time heartbeat peers change;
+we think that made no sense, because a newer report is no evidence that
+the OSD failed later, only that its reporter started watching it later.
+
+Failure scenario:
+
+  When a whole host dies (e.g. it loses power), I/O to PGs whose primary is
+  one of its OSDs hangs until the monitors mark that OSD down.
+
+  In our production cluster (v20.2.1, 212 OSDs on 18 hosts), the last OSD of
+  a dead host with 12 OSDs was marked down with a large delay (7 min 51 s)
+  after the host lost power, with the monitor logging
+
+      after 67.770186 >= grace 62.788019
+
+  The slow failover causes unnecessarily long hangs:
+  For example, for us it blocked all of CephFS for those minutes, as the
+  replacement MDS waited in `up:rejoin` for metadata objects in such PGs.
+
+Background: How the monitor detects a dead OSD:
+
+  If only an OSD process dies, the kernel of its still-running host refuses
+  connections to it, and peers report that to the monitor as an immediate
+  failure (`osd_fast_fail_on_connection_refused`), which marks the OSD down
+  right away.
+  If instead the whole host dies, nothing answers at all (no connection
+  refusals or resets), so Ceph has implemented that the OSD is detected
+  as down by heartbeat timeouts:
+  Every OSD pings a set of heartbeat peers,
+  and reports a peer that has not answered for `osd_heartbeat_grace` to the
+  monitor, including since when it has not answered (`failed_since`).
+  The monitor collects these reports per target OSD in `failure_info_t`.
+  So that a single OSD with a bad network link cannot get healthy OSDs
+  marked down, the monitor marks the target down only if:
+
+  * reports come from at least `mon_osd_min_down_reporters` different CRUSH
+    subtrees (`mon_osd_reporter_subtree_level`, default `host`), and
+  * the failure has lasted at least the grace period: `osd_heartbeat_grace`,
+    increased by `mon_osd_adjust_heartbeat_grace` for OSDs that have a
+    history of being marked down while still alive, to avoid flapping.
+
+  A reporter withdraws its report when it stops having the target as a
+  heartbeat peer.
+
+Problem:
+
+  Until now, `OSDMonitor::check_failure()` measured the failure duration as
+  `now - failure_info_t::get_failed_since()`, where `get_failed_since()`
+  returned the most recent `failed_since` of all current reporters.
+  So each reporter that started reporting later moved the start of the
+  failure forward. When a host died, this happened systematically:
+
+  * Each OSD marked down creates a new osdmap, after which OSDs re-pick their
+    heartbeat peers (`OSD::maybe_update_heartbeat_peers()`).
+  * A newly assigned peer of a dead, not yet marked down OSD never gets a
+    reply, and reports it with `failed_since` = the time of its own first
+    ping (`first_tx` in `OSD::heartbeat_check()`), i.e. a recent time.
+  * Peers that stop watching the dead OSD withdraw their older reports
+    (`send_still_alive()`, `cancel_report()`), which made the monitor
+    recompute the maximum from the remaining, newer reports.
+
+  The OSDs of a dead host usually have different graces (through
+  `mon_osd_adjust_heartbeat_grace`), so they are marked down one after
+  another, and the remaining ones keep getting fresh reporters:
+  Until now, their failure clocks thus kept restarting,
+  and more reports made the decision later.
+  In the production incident above, the last OSD collected reports from 200
+  different OSDs over those minutes, 58 of them already in the first minute.
+
+  Taking the most recent `failed_since` was introduced in commit
+
+      7952c35926c "mon: locally apply osd heartbeat grace to failure checks"
+
+  whose message says:
+
+      Aggregate the failure reports into a single mon 'failed_since' value (the
+      max, currently), and wait until we have exceeded the grace period to
+      consider the osd failed.
+
+  It gives no reason for the maximum, and "currently" suggests that it was
+  not meant as the final choice.
+  In any case, it isn't clear to me why that would be a good choice.
+
+Fix:
+
+  With this commit, `check_failure()` takes for each reporting subtree the
+  oldest `failed_since` among its reporters, and considers the OSD failed
+  since the `mon_osd_min_down_reporters`-th oldest of these, i.e. since the
+  time at which that many different subtrees had all observed the failure.
+  The requirement that `mon_osd_min_down_reporters` different subtrees agree
+  is unchanged, and so is the grace; but a reporter that started watching
+  late can no longer hide that other subtrees have observed the failure for
+  much longer.
+
+Results:
+
+  Local reproduction:
+  3 mons, 18 CRUSH hosts x 10 memstore OSDs, a size-3 pool with 2048 PGs.
+  We first give the victim host's OSDs differing laggy histories, as real
+  reboots do: Twice, we stop them until they are marked down, and continue
+  them one after another, so that each stays down for a different time.
+  Through `mon_osd_adjust_heartbeat_grace`, they thus get different graces,
+  so that they are later marked down one after another, which causes the
+  heartbeat peer re-picks and fresh reports described above.
+  Then its 10 OSDs and the leader mon are stopped with SIGSTOP
+  (no connections get closed, as with a powered-off host).
+  Time from stopping until the 10 OSDs were marked down:
+
+  | version       | runs | last of the 10 OSDs marked down after (s)          | worst delay beyond the OSD's own grace (s) |
+  |---------------|------|----------------------------------------------------|--------------------------------------------|
+  | v20.2.1       | 8    | 37.7, 42.3, 45.4, 49.7, 52.2, 146.0, 192.1, 194.6  | 159                                        |
+  | v20.2.1 + fix | 7    | 33.0, 33.2, 33.3, 33.8, 35.9, 36.0, 36.4           | 1.7                                        |
+
+Fixes: https://tracker.ceph.com/issues/83176
+Assisted-by: Claude Opus 5.5 in Zoo Code, human review
+Signed-off-by: Niklas Hambüchen <mail@nh2.me>
+---
+ src/mon/OSDMonitor.cc | 34 ++++++++++++++++++++++++++++------
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/src/mon/OSDMonitor.cc b/src/mon/OSDMonitor.cc
+index 1a96c741194..3568d527fc0 100644
+--- a/src/mon/OSDMonitor.cc
++++ b/src/mon/OSDMonitor.cc
+@@ -3375,7 +3375,12 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
+     return true;
+   }
+ 
+-  set<string> reporters_by_subtree;
++  // For each reporting subtree (e.g. host), the oldest `failed_since` among
++  // its reporters, i.e. since when that subtree has observed the failure.
++  // A reporter that was assigned to `target_osd` as heartbeat peer only
++  // recently reports a recent `failed_since`; that must not hide that other
++  // subtrees have observed the failure for much longer.
++  map<string, utime_t> oldest_failed_since_by_subtree;
+   auto reporter_subtree_level = g_conf().get_val<string>("mon_osd_reporter_subtree_level");
+   ceph_assert(fi.reporters.size());
+   for (auto p = fi.reporters.begin(); p != fi.reporters.end();) {
+@@ -3383,11 +3388,17 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
+     // fall back to OSD if the level doesn't exist.
+     if (osdmap.exists(p->first)) {
+       auto reporter_loc = osdmap.crush->get_full_location(p->first);
++      string subtree;
+       if (auto iter = reporter_loc.find(reporter_subtree_level);
+           iter == reporter_loc.end()) {
+-        reporters_by_subtree.insert("osd." + to_string(p->first));
++        subtree = "osd." + to_string(p->first);
+       } else {
+-        reporters_by_subtree.insert(iter->second);
++        subtree = iter->second;
++      }
++      const utime_t reporter_failed_since = p->second.failed_since;
++      auto [it, inserted] = oldest_failed_since_by_subtree.emplace(subtree, reporter_failed_since);
++      if (!inserted && reporter_failed_since < it->second) {
++        it->second = reporter_failed_since;
+       }
+       ++p;
+     } else {
+@@ -3395,10 +3406,21 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
+       p = fi.reporters.erase(p);
+     }
+   }
+-  if (reporters_by_subtree.size() < g_conf().get_val<uint64_t>("mon_osd_min_down_reporters")) {
++  const uint64_t min_down_reporters = std::max<uint64_t>(1, g_conf().get_val<uint64_t>("mon_osd_min_down_reporters"));
++  if (oldest_failed_since_by_subtree.size() < min_down_reporters) {
+     return false;
+   }
+-  const utime_t failed_for = now - fi.get_failed_since();
++  // The OSD is considered failed since the time at which `min_down_reporters`
++  // different subtrees had all observed the failure:
++  // The `min_down_reporters`-th oldest of the per-subtree times.
++  vector<utime_t> subtree_failed_since;
++  subtree_failed_since.reserve(oldest_failed_since_by_subtree.size());
++  for (const auto& [subtree, since] : oldest_failed_since_by_subtree) {
++    subtree_failed_since.push_back(since);
++  }
++  const vector<utime_t>::iterator kth_oldest = subtree_failed_since.begin() + (min_down_reporters - 1);
++  std::nth_element(subtree_failed_since.begin(), kth_oldest, subtree_failed_since.end());
++  const utime_t failed_for = now - *kth_oldest;
+   const utime_t grace = get_grace_time(now, target_osd, fi);
+   if (failed_for >= grace) {
+     dout(1) << " we have enough reporters to mark osd." << target_osd
+@@ -3409,7 +3431,7 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
+ 		      << osdmap.crush->get_full_location_ordered_string(
+ 			target_osd)
+ 		      << ") ("
+-		      << (int)reporters_by_subtree.size()
++		      << (int)oldest_failed_since_by_subtree.size()
+ 		      << " reporters from different "
+ 		      << reporter_subtree_level << " after "
+ 		      << failed_for << " >= grace " << grace << ")";
+-- 
+2.51.2
+
